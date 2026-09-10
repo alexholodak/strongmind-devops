@@ -1,0 +1,424 @@
+# =============================================================================
+# StrongMind standard Rails CI/CD pipeline
+#
+# Adopt by copying this file and changing the three values in `env:` below.
+#
+#   push to any branch   -> test + brakeman + build (amd64, not pushed)
+#   push to main         -> above, then push to ECR and deploy production
+#   workflow_dispatch    -> above, then deploy to the chosen environment
+#
+# AWS access is GitHub OIDC only; no access keys. Trust policies in README.md.
+#
+# GitHub environments: `production` and `staging`, referenced by `deploy` only.
+# The production gate is branch protection on main. Required reviewers on the
+# environment are optional; approvals are per job, so with only `deploy`
+# referencing one, enabling them prompts once, on a SHA already built,
+# scanned and pushed.
+#
+# Repository secrets:
+#   AWS_ACCOUNT_ID     builds the OIDC role ARN
+#   ECR_REPOSITORY     full URI, e.g. 123456789012.dkr.ecr.us-east-1.amazonaws.com/rails-app
+#   SLACK_WEBHOOK_URL  #deploys notifications
+#   RAILS_MASTER_KEY   only if the test suite needs credentials.yml.enc
+# =============================================================================
+
+name: rails-deploy
+
+on:
+  push:
+    branches: ["**"]
+    tags-ignore: ["**"]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        type: choice
+        required: false
+        default: production
+        options: [production, staging]
+
+# Jobs raise `id-token` only where they assume an AWS role.
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  ECS_TASK_FAMILY: rails-app
+  ECS_SERVICE: rails-app
+  CONTAINER_NAME: rails-app
+  # Matches `aws ecs wait services-stable` (40 x 15s) used by the rollback.
+  DEPLOY_TIMEOUT_MINUTES: "10"
+
+# Superseded CI runs on a branch are cancelled. Deploys are never cancelled;
+# the deploy job has its own per-environment group below.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Resolve environment names once so every downstream job agrees.
+  # ---------------------------------------------------------------------------
+  resolve:
+    name: Resolve environment
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      environment: ${{ steps.env.outputs.environment }}
+      cluster: ${{ steps.env.outputs.cluster }}
+      should_deploy: ${{ steps.env.outputs.should_deploy }}
+    steps:
+      - id: env
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            ENVIRONMENT="${{ inputs.environment }}"
+            SHOULD_DEPLOY="true"
+            # Production only ever deploys main. Feature branches may target staging.
+            if [[ "$ENVIRONMENT" == "production" && "${{ github.ref }}" != "refs/heads/main" ]]; then
+              echo "::error::Production deploys must be dispatched from main (got ${{ github.ref }})."
+              exit 1
+            fi
+          elif [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
+            ENVIRONMENT="production"
+            SHOULD_DEPLOY="true"
+          else
+            ENVIRONMENT="none"
+            SHOULD_DEPLOY="false"
+          fi
+
+          case "$ENVIRONMENT" in
+            production) CLUSTER="strongmind-production" ;;
+            staging)    CLUSTER="strongmind-staging" ;;
+            *)          CLUSTER="" ;;
+          esac
+
+          {
+            echo "environment=$ENVIRONMENT"
+            echo "cluster=$CLUSTER"
+            echo "should_deploy=$SHOULD_DEPLOY"
+          } >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------------------
+  # RSpec against a real Postgres matching the RDS engine version.
+  # ---------------------------------------------------------------------------
+  test:
+    name: RSpec
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: rails
+          POSTGRES_PASSWORD: rails
+          POSTGRES_DB: rails_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U rails"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      RAILS_ENV: test
+      DATABASE_URL: postgres://rails:rails@localhost:5432/rails_test
+      RAILS_MASTER_KEY: ${{ secrets.RAILS_MASTER_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Ruby with cached gems
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: .ruby-version   # same file the Dockerfile build-arg reads
+          bundler-cache: true           # bundle install, cached on Gemfile.lock
+
+      - name: Prepare database
+        run: bin/rails db:prepare
+
+      - name: Run RSpec
+        run: bundle exec rspec --format progress --format RspecJunitFormatter --out tmp/rspec.xml
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: rspec-results
+          path: tmp/rspec.xml
+          retention-days: 7
+
+  # ---------------------------------------------------------------------------
+  # Brakeman in parallel with RSpec. Fails on medium+ confidence findings;
+  # SARIF upload puts them in the Security tab and as PR annotations.
+  # ---------------------------------------------------------------------------
+  brakeman:
+    name: Brakeman
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: .ruby-version
+          bundler-cache: true
+
+      - name: Run Brakeman
+        run: |
+          bundle exec brakeman \
+            --quiet --no-pager \
+            --confidence-level 2 \
+            --format sarif --output brakeman.sarif \
+            --exit-on-warn
+
+      - name: Upload SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: brakeman.sarif
+
+  # ---------------------------------------------------------------------------
+  # Branch pushes: amd64 only, not pushed. Validates the Dockerfile cheaply.
+  # Deploy runs: amd64 + arm64, pushed with the git SHA as an immutable tag;
+  # `latest` only on production. The task definition always pins the SHA.
+  #
+  # arm64 under QEMU roughly triples build time (native extensions). Accepted
+  # to keep Graviton an option; move to a native arm runner if it hurts.
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build image
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [resolve, test, brakeman]
+    permissions:
+      contents: read
+      id-token: write
+    # No `environment:` here. The OIDC subject is the branch ref, trusted by
+    # the push role (`ref:refs/heads/*`), which can write to ECR and nothing
+    # else. Referencing the target environment would make any required
+    # reviewers prompt twice per run, since approvals are per job.
+    outputs:
+      # Only the tag crosses the job boundary. GitHub drops job outputs that
+      # contain a secret, and the full URI contains ECR_REPOSITORY.
+      image_tag: ${{ github.sha }}
+    env:
+      SHOULD_PUSH: ${{ needs.resolve.outputs.should_deploy }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        if: env.SHOULD_PUSH == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-actions-rails-push
+          role-session-name: gha-${{ github.run_id }}-build
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Log in to ECR
+        if: env.SHOULD_PUSH == 'true'
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up QEMU
+        if: env.SHOULD_PUSH == 'true'
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Compute image tags
+        id: meta
+        run: |
+          REPO="${{ secrets.ECR_REPOSITORY }}"
+          TAGS="${REPO}:${{ github.sha }}"
+          if [[ "${{ needs.resolve.outputs.environment }}" == "production" ]]; then
+            TAGS="${TAGS},${REPO}:latest"
+          fi
+          # Step outputs may hold secrets; only job outputs are dropped.
+          echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
+          echo "ruby_version=$(tr -d '[:space:]' < .ruby-version | sed 's/^ruby-//')" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          target: runtime
+          platforms: ${{ env.SHOULD_PUSH == 'true' && 'linux/amd64,linux/arm64' || 'linux/amd64' }}
+          push: ${{ env.SHOULD_PUSH == 'true' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          # mode=max caches the builder stage too, not just the final image.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          # Attestation manifests confuse some ECS tooling. Off until wanted.
+          provenance: false
+          build-args: |
+            GIT_SHA=${{ github.sha }}
+            RUBY_VERSION=${{ steps.meta.outputs.ruby_version }}
+
+  # ---------------------------------------------------------------------------
+  # 1. Record the task definition the service is RUNNING as the rollback
+  #    target. Not "latest revision minus one": a failed deploy may have
+  #    registered a revision that never ran.
+  # 2. Render a new revision from the live one with the image swapped.
+  # 3. Register, update the service, wait for stability with a hard timeout.
+  # 4. On failure after the update: roll back to the recorded revision, notify.
+  #
+  # The ECS circuit breaker (see README) independently reverts a revision that
+  # fails health checks. This explicit path also covers "healthy but never
+  # stable within the timeout" and guarantees the notification. It checks what
+  # the service is running first: if the breaker already rolled back, it waits
+  # for stability instead of replacing every task a second time.
+  # ---------------------------------------------------------------------------
+  deploy:
+    name: Deploy to ${{ needs.resolve.outputs.environment }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    needs: [resolve, build]
+    if: needs.resolve.outputs.should_deploy == 'true'
+    # Enables required reviewers and environment-scoped secrets.
+    environment:
+      name: ${{ needs.resolve.outputs.environment }}
+    # One deploy per environment. Never cancel in flight: a half-applied
+    # service update is worse than a queued one.
+    concurrency:
+      group: deploy-${{ needs.resolve.outputs.environment }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      ECS_CLUSTER: ${{ needs.resolve.outputs.cluster }}
+      # Reassembled from the secret; see the `build` outputs note.
+      IMAGE: ${{ secrets.ECR_REPOSITORY }}:${{ needs.build.outputs.image_tag }}
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          # One deploy role per environment, each trusting only its own OIDC
+          # subject, so a staging token can never reach the production cluster.
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-actions-rails-deploy-${{ needs.resolve.outputs.environment }}
+          role-session-name: gha-${{ github.run_id }}-deploy
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Record currently running task definition (rollback target)
+        id: current
+        run: |
+          RUNNING_TD=$(aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE" \
+            --query 'services[0].taskDefinition' \
+            --output text)
+          echo "Rollback target: $RUNNING_TD"
+          echo "task_definition_arn=$RUNNING_TD" >> "$GITHUB_OUTPUT"
+
+          # The live revision is the template, so env, secrets, sidecars and
+          # limits are inherited rather than duplicated in this repo.
+          aws ecs describe-task-definition \
+            --task-definition "$RUNNING_TD" \
+            --query 'taskDefinition' \
+            --output json > task-definition.json
+
+      - name: Render new task definition with image ${{ env.IMAGE }}
+        id: render
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: ${{ env.CONTAINER_NAME }}
+          image: ${{ env.IMAGE }}
+          # Deployed SHA inside the container for log correlation.
+          environment-variables: |
+            GIT_SHA=${{ github.sha }}
+
+      - name: Register task definition and update service
+        id: deploy
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render.outputs.task-definition }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          service: ${{ env.ECS_SERVICE }}
+          wait-for-service-stability: true
+          wait-for-minutes: ${{ env.DEPLOY_TIMEOUT_MINUTES }}
+
+      # -- Failure path ------------------------------------------------------
+
+      - name: Roll back to previous task definition
+        id: rollback
+        if: failure() && steps.deploy.outcome == 'failure'
+        run: |
+          set -euo pipefail
+          TARGET="${{ steps.current.outputs.task_definition_arn }}"
+          echo "::error::Deploy did not stabilize within ${DEPLOY_TIMEOUT_MINUTES}m. Rollback target: $TARGET"
+
+          # The circuit breaker may already have rolled the service back. In
+          # that case the PRIMARY deployment is on TARGET and forcing another
+          # deployment of it would replace every task a second time for
+          # nothing. Check first; the wait below covers both paths.
+          PRIMARY=$(aws ecs describe-services \
+            --cluster "$ECS_CLUSTER" \
+            --services "$ECS_SERVICE" \
+            --query "services[0].deployments[?status=='PRIMARY'].taskDefinition | [0]" \
+            --output text)
+
+          if [[ "$PRIMARY" == "$TARGET" ]]; then
+            echo "Service is already on $TARGET (ECS circuit breaker rolled back). Not redeploying."
+            HOW="circuit breaker"
+          else
+            echo "Service is on $PRIMARY. Rolling back to $TARGET."
+            aws ecs update-service \
+              --cluster "$ECS_CLUSTER" \
+              --service "$ECS_SERVICE" \
+              --task-definition "$TARGET" \
+              --force-new-deployment \
+              --output text --query 'service.deployments[0].id'
+            HOW="pipeline"
+          fi
+
+          # Same 10-minute stability budget as the deploy, on either path.
+          if aws ecs wait services-stable --cluster "$ECS_CLUSTER" --services "$ECS_SERVICE"; then
+            echo "rollback_status=succeeded ($HOW)" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Rollback did not stabilize. Manual intervention required."
+            echo "rollback_status=failed ($HOW)" >> "$GITHUB_OUTPUT"
+            exit 1
+          fi
+
+      - name: Deregister failed task definition
+        if: failure() && steps.deploy.outcome == 'failure' && steps.deploy.outputs.task-definition-arn != ''
+        continue-on-error: true
+        run: |
+          # So nobody redeploys the bad revision from the console. Non-fatal.
+          aws ecs deregister-task-definition \
+            --task-definition "${{ steps.deploy.outputs.task-definition-arn }}" \
+            --query 'taskDefinition.taskDefinitionArn' --output text
+
+      - name: Notify on failure
+        if: failure()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          ROLLBACK_STATUS: ${{ steps.rollback.outputs.rollback_status || 'not attempted' }}
+        run: |
+          # Payload is public repo metadata only; the webhook URL is never echoed.
+          payload=$(jq -n \
+            --arg env  "${{ needs.resolve.outputs.environment }}" \
+            --arg sha  "${{ github.sha }}" \
+            --arg who  "${{ github.actor }}" \
+            --arg url  "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --arg rb   "$ROLLBACK_STATUS" \
+            '{text: (":rotating_light: *rails-app deploy to \($env) FAILED*\nCommit: `\($sha)` by \($who)\nRollback: \($rb)\n<\($url)|View run>")}')
+          curl -sS -X POST -H 'Content-Type: application/json' --data "$payload" "$SLACK_WEBHOOK_URL"
+
+      - name: Notify on success
+        if: success()
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          payload=$(jq -n \
+            --arg env "${{ needs.resolve.outputs.environment }}" \
+            --arg sha "${{ github.sha }}" \
+            --arg who "${{ github.actor }}" \
+            '{text: (":white_check_mark: rails-app deployed to \($env): `\($sha)` by \($who)")}')
+          curl -sS -X POST -H 'Content-Type: application/json' --data "$payload" "$SLACK_WEBHOOK_URL"

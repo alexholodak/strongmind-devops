@@ -1,0 +1,42 @@
+# The builder does `COPY . .` and the runtime stage copies /rails wholesale,
+# so anything not excluded here ships to production.
+
+# Version control and CI
+.git
+.gitignore
+.github
+.dockerignore
+
+# Secrets. RAILS_MASTER_KEY arrives from Secrets Manager at runtime.
+config/master.key
+config/credentials/*.key
+.env*
+
+# Test and development
+spec
+test
+.rspec
+.rubocop.yml
+brakeman.sarif
+coverage
+.byebug_history
+
+# Runtime artifacts and caches
+log/*
+tmp/*
+storage/*
+public/assets
+public/packs
+node_modules
+.bundle
+vendor/bundle
+
+# Editor and OS
+.idea
+.vscode
+*.swp
+.DS_Store
+
+# Docs (this repo's exercise write-ups)
+*.md
+docs
