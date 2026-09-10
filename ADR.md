@@ -24,7 +24,7 @@ The Identity Server is a .NET 6 authentication and token-issuance service that e
 
 - Everything else runs on ECS Fargate. This is the only service where on-call needs a second console, alerting path, and IAM model, and it is the one service whose failure takes every product down.
 - Observability is split. The Azure side is not wired into the CloudWatch and Jira Operations pipeline the rest of the platform uses (see OBSERVABILITY.md).
-- .NET 6 reached end of support in November 2024. The runtime upgrade is needed regardless and is far easier on a containerized build.
+- .NET 6 reached end of support in November 2024. The runtime upgrade is needed regardless and is far easier on a containerized build. The target is .NET 10 (LTS, supported to November 2028), not .NET 8: .NET 8 leaves support on November 10, 2026, which is inside this migration's window.
 - One cloud eliminates cross-cloud egress and simplifies the Azure enterprise agreement renewal.
 
 **Constraints**
@@ -86,7 +86,7 @@ The core principle: **change one thing at a time.** Cloud provider changes now. 
 
 **Container image**
 
-- Base: `mcr.microsoft.com/dotnet/aspnet:6.0` (last published patch), multi-stage build from `sdk:6.0`. Runs as the `app` user (uid 1654). Image scanned on push by Amazon Inspector via ECR enhanced scanning.
+- Base: `mcr.microsoft.com/dotnet/aspnet:6.0` (last published patch), multi-stage build from `sdk:6.0`. The 6.0 images ship no non-root user, so the Dockerfile creates one (`app`, uid 1654, matching the `APP_UID` convention that .NET 8+ images ship built in, so nothing changes at the upgrade). Image scanned on push by Amazon Inspector via ECR enhanced scanning.
 - This base image no longer receives security patches. See risk R4.
 
 **ASP.NET Data Protection**
@@ -224,7 +224,7 @@ Alternative: BACPAC for the initial load, then DMS CDC-only. Rejected because a 
 | R1 | Tokens issued on one side fail validation on the other because signing keys differ or `kid` values do not match | Low | Critical: every product breaks | Same PFX migrated byte-for-byte. Step 1 verifies JWKS equality before any traffic shifts. A canary validates an Azure-issued token against the AWS instance and vice versa hourly during the weighted phase. |
 | R2 | Azure AD DS lookups over the VPN add latency or fail intermittently, degrading login p95 | Medium | High: SLO breach during school start | Measure LDAP round-trip at step 1. Application-level LDAP connection pooling and a 5s timeout with circuit breaker (Polly). Two VPN tunnels with BGP failover. Follow-up ADR to remove the cross-cloud dependency within one quarter. |
 | R3 | DMS CDC drops or mangles data: identity columns, `datetime2` precision, computed columns, or CDC lag during peak | Medium | High: users lose sessions or, worse, grants are duplicated | Schema owned by EF Core, not DMS. Validation enabled and diffed before cutover. Cutover at 02:00 MT when change volume is near zero. Full dry run on a snapshot two weeks out. |
-| R4 | .NET 6 runtime image is end-of-life and receives no security patches | High (certain) | Medium: known CVEs in the runtime | Pin the final patched image, enable ECR enhanced scanning, accept the finding with an expiry. .NET 8 LTS upgrade is the first post-migration sprint, now trivial because the build is containerized. |
+| R4 | .NET 6 runtime image is end-of-life and receives no security patches | High (certain) | Medium: known CVEs in the runtime | Pin the final patched image, enable ECR enhanced scanning, accept the finding with an expiry. .NET 10 LTS upgrade is the first post-migration sprint, now a base-image change plus a test cycle because the build is containerized. Not .NET 8: its support ends November 10, 2026, roughly when that sprint would land. |
 | R5 | A downstream caller (most likely PowerSchool) has the `*.azurewebsites.net` hostname hardcoded rather than the custom domain | Medium | High: that integration silently breaks at step 7 | Audit App Service access logs for Host headers before step 0. Keep the App Service at weight 0 for 10 days and alert on any request. If found, serve that hostname from the ALB or coordinate with the vendor. |
 | R6 | Client-side DNS caching ignores the 60s TTL (Java runtimes, some corporate resolvers) and keeps sending to Azure after step 6 | Medium | Low: Azure still works until step 7 | 10-day dwell at weight 0 before shutdown. Azure record removal, not App Service shutdown, is the true cutoff. |
 | R7 | RDS Multi-AZ failover during school start | Low | Medium: 60-120s of DB unavailability, connection pool churn | Maintenance window set to Sunday 03:00 MT. EF Core retry-on-failure enabled. Alarm on `FailoverEvent` routed to page. |
@@ -245,8 +245,8 @@ Complete when all of the following are observable, not when the last step runs:
 
 ## 8. Consequences
 
-**Easier:** one cloud, one on-call surface, one observability pipeline, reproducible builds, and a straightforward path to the .NET 8 upgrade.
+**Easier:** one cloud, one on-call surface, one observability pipeline, reproducible builds, and a straightforward path to the .NET 10 upgrade.
 
 **Harder:** RDS SQL Server is more expensive per vCPU than Azure SQL serverless tiers and needs hands-on maintenance windows. The team takes ownership of SQL Server patching and tuning that Azure SQL abstracted.
 
-**Revisit:** Azure AD DS dependency (next quarter), .NET 8 upgrade (next sprint), Aurora PostgreSQL or Cognito evaluation (after 90 days of stable operation on AWS).
+**Revisit:** Azure AD DS dependency (next quarter), .NET 10 upgrade (next sprint), Aurora PostgreSQL or Cognito evaluation (after 90 days of stable operation on AWS).
