@@ -187,7 +187,7 @@ jobs:
   # `latest` only on production. The task definition always pins the SHA.
   #
   # arm64 under QEMU roughly triples build time (native extensions). Accepted
-  # to keep Graviton an option; move to a native arm runner if it hurts.
+  # to keep Graviton an option; move to a native arm runner if it takes too long.
   # ---------------------------------------------------------------------------
   build:
     name: Build image
