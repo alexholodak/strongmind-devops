@@ -159,6 +159,7 @@ jobs:
     permissions:
       contents: read
       security-events: write
+      actions: read           # upload-sarif status reporting
     steps:
       - uses: actions/checkout@v4
 
@@ -176,8 +177,10 @@ jobs:
             --exit-on-warn
 
       - name: Upload SARIF
-        if: always()
-        uses: github/codeql-action/upload-sarif@v3
+        # always(): findings must upload when Brakeman exits non-zero on
+        # warnings. hashFiles(): but not when Brakeman never ran at all.
+        if: always() && hashFiles('brakeman.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: brakeman.sarif
 
@@ -274,7 +277,9 @@ jobs:
   # for stability instead of replacing every task a second time.
   # ---------------------------------------------------------------------------
   deploy:
-    name: Deploy to ${{ needs.resolve.outputs.environment }}
+    # Static name: GitHub does not evaluate expressions in the name of a
+    # skipped job, and this job is skipped on every branch push.
+    name: Deploy
     runs-on: ubuntu-latest
     timeout-minutes: 30
     needs: [resolve, build]
