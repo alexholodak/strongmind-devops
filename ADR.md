@@ -2,7 +2,7 @@
 
 **Status:** Proposed
 **Date:** 2026-09-08
-**Author:** Alex Holodak, Staff DevOps Engineer
+**Author:** Alex Holodak, DevOps Engineer
 **Deciders:** Platform Engineering, Security, LMS and Integrations team leads
 
 ---
